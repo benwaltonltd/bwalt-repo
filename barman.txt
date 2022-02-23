@@ -1,0 +1,335 @@
+
+For all servers
+sudo yum install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-7-x86_64/pgdg-redhat-repo-latest.noarch.rpm
+
+- Barman server
+yum install -y barman
+
+- On all servers
+yum install -y barman-cli
+
+- On database servers and barman server(but not initialize)
+yum install -y postgresql13-server
+sudo /usr/pgsql-13/bin/postgresql-13-setup initdb
+
+echo "listen_addresses = '*'" >> /var/lib/pgsql/13/data/postgresql.conf
+echo 'host all all all md5' >> /var/lib/pgsql/13/data/pg_hba.conf
+echo 'host replication all all md5' >> /var/lib/pgsql/13/data/pg_hba.conf
+echo "archive_mode = on" >>  /var/lib/pgsql/13/data/postgresql.conf
+echo "archive_command = '\bin\true'" >>  /var/lib/pgsql/13/data/postgresql.conf
+- Creating .pgpass for all servers
+
+echo "*:*:*:postgres:Xoo4eiho" > /var/lib/pgsql/.pgpass
+echo "*:*:*:barman:eilo4Eim" > /var/lib/pgsql/.pgpass
+echo "*:*:*:streaming_barman:ye1Thie5" >> /var/lib/pgsql/.pgpass
+chmod 600 /var/lib/pgsql/.pgpass
+
+For barman server
+echo "*:*:*:postgres:Xoo4eiho" > /var/lib/barman/.pgpass
+echo "*:*:*:barman:eilo4Eim" > /var/lib/barman/.pgpass
+echo "*:*:*:streaming_barman:ye1Thie5" >> /var/lib/barman/.pgpass
+chmod 600 /var/lib/barman/.pgpass
+
+## Create Barman database users on database host
+
+CREATE USER barman WITH SUPERUSER PASSWORD 'eilo4Eim';
+CREATE USER streaming_barman WITH REPLICATION PASSWORD 'ye1Thie5';
+
+Setup ssh
+----------
+You need to make sure that on the master, you create ssh to barman server to user barman. Also make sure that you create a .pgpass file and a user barman in the database. Also open connection for barman user in pg_hba.conf file
+
+As root, create a file called `/etc/barman.d/master.conf` with the following contents:
+
+vi /etc/barman.conf
+
+[barman]
+barman_user = barman
+configuration_files_directory = /etc/barman.d
+barman_home = /var/lib/barman
+log_file = /var/log/barman/barman.log
+log_level = INFO
+network_compression = false
+retention_policy = RECOVERY WINDOW OF 1 WEEK
+minimum_redundancy = 2
+last_backup_maximum_age = 2 DAYS
+backup_options = exclusive_backup
+parallel_jobs = 4
+immediate_checkpoint = true
+
+[master]
+description = "PostgreSQL primary database"
+ssh_command = ssh -q postgres@barman2
+conninfo = host=barman2 user=barman dbname=postgres
+streaming_conninfo = host=barman2 user=streaming_barman
+backup_method = rsync
+reuse_backup = link
+archiver = on
+archiver_batch_size = 50
+streaming_archiver = on
+slot_name = barman_master
+create_slot = auto
+streaming_archiver_name = barman_receive_wal_master
+streaming_archiver_batch_size = 50
+
+recovery_options = get-wal
+path_prefix = "/usr/pgsql-13/bin/"
+active = true
+---
+su - barman
+barman list-server
+barman check master
+
+As you can see there are several configuration issues! We should now fix them one by one.
+
+barman status master
+barman show-server master
+
+## Set archive_mode and archive_command on Postgres
+ALTER SYSTEM SET archive_mode = on;
+ALTER SYSTEM SET archive_command = 'barman-wal-archive barman1 master %p'
+-Restart the cluster
+
+#Also check `pg_replication_slots` on Postgres, and confirm the slot exists, but it's still inactive after creation
+barman receive-wal --create-slot master
+barman replication-status master
+
+## Start pg_receivewal on Barman
+barman cron
+ps aux | grep receive
+
+
+Now run `barman check master` again.
+If the server has no load, you will still see:
+
+```
+WAL archive: FAILED (please make sure WAL shipping is setup)
+```
+barman switch-wal --archive --archive-timeout 60 master
+
+barman replication-status master
+
+Now run `barman check master` again. You will finally see this:
+barman check master
+
+
+
+As you can see, the only `FAILED` items are about backup (backup maximum age and minimum redundancy requirements). In the next runbook we will see how to take a backup.
+
+barman backup master
+barman list-backup master
+
+If you want to list backups for all servers, use:
+barman list-backup all
+barman show-backup master 20210810T044727
+
+## Minimum redundancy requirements
+Run `barman check master`, output will be:
+barman check all
+
+We are still not all green: minimum redundancy requirements is still failing. We need a second backup.
+
+But first, let's add some changes to the Postgres database, as if we were using it in the real world. These changes will help us test PITR later.
+CREATE TABLE table_test (
+  id INTEGER PRIMARY KEY,
+  dt TIMESTAMP WITHOUT TIME ZONE DEFAULT now()
+);
+INSERT INTO table_test VALUES (1);
+SELECT pg_sleep(10);
+INSERT INTO table_test VALUES (2);
+SELECT pg_sleep(10);
+INSERT INTO table_test VALUES (3);
+SELECT pg_switch_wal();
+SELECT pg_switch_wal();
+
+On Barman, make sure `barman cron` has executed:
+barman cron
+barman list-backup all
+
+barman backup master
+barman list-backup master
+barman show-backup master latest
+
+In this case it has a deduplication rate of 99.85%. The base backup is still 1.5GB of size, but on disk only 2.4MB are used.
+We can confirm that in another way:
+
+```
+barman@9c99447bf70f:~$ cd master/base/
+barman@9c99447bf70f:~/master/base$ du -sh --apparent-size *
+1.5G	20210810T044727
+2.5M	20210810T052316
+
+## Delete a backup
+barman delete master oldest
+
+barman delete master oldest
+WARNING: Skipping delete of backup 20210810T044727 for server master due to minimum redundancy requirements (minimum redundancy = 2, current redundancy = 2)
+Which means Barman prevents us from deleting the oldest backup because of `minimum_redundancy`.
+
+# Recover with get-wal
+Recover the latest base backup of the primary using `get-wal` as recovery options.
+## Make sure Postgres is down and PGDATA is empty on the restore server
+
+```bash
+pg_ctlcluster 13 main stop
+rm -rf /var/lib/pgsql/13/data/*
+
+## Run barman recover
+
+We have configured `recovery_options = 'get-wal'`:
+barman show-server master | grep recovery_options
+
+So we don't need to specify the `--get-wal` argument. Recovery would be simply:
+barman recover -remote-ssh-command "ssh postgres@pgrestore" master latest /var/lib/pgsql/13/data/
+
+- The recovery creates a recovery.signal file in pgrestore
+
+If it was PostgreSQL 11 or older, the recovery settings would have been written to the file `recovery.conf` instead.
+We will need to amend the `restore_command`, replacing the container ID with the container name, so it's properly set to:
+```
+restore_command = 'barman-wal-restore -P -U barman pgbkp1 master %f %p'
+
+## Start Postgres
+```bash
+docker exec pgrestore pg_ctlcluster 13 main start
+
+Perform a PITR using Barman.
+-----------------------------
+## Make sure Postgres is down and PGDATA is empty on the restore server
+pg_ctlcluster 13 main stop
+rm -rf /var/lib/pgsql/13/data/*
+
+In Runbook 10, we have prepared some data to help us demonstrate a PITR. Check the primary to see the data:
+
+```bash
+psql -c 'SELECT * FROM table_test ORDER BY id'
+psql -c 'SELECT * FROM table_test ORDER BY id'
+
+Imagine someone made a mistake and performed a `DELETE` without a `WHERE`:
+
+```bash
+psql -c 'DELETE FROM table_test'
+
+psql -c 'DELETE FROM table_test'
+DELETE 3
+psql -c 'SELECT * FROM table_test ORDER BY id'
+ id | dt
+----+----
+(0 rows)
+
+## Run the recover
+
+So our initial plan is to go back to `2021-08-17 03:14:20` to see how the table was at that time. When Postgres reaches that time, we want it to pause replication, so we can connect and check how is the database, and that allows us to optionally adjust the target time and proceed to recover some more WAL.
+Also, order to go back to `03:14:20`, it's required that we recover a base backup from before that timestamp. The list of backups is currently this:
+
+barman list-backup master
+master 20210817T031638 - Tue Aug 17 03:16:38 2021 - Size: 1.5 GiB - WAL Size: 0 B
+master 20210817T031157 - Tue Aug 17 03:12:06 2021 - Size: 1.5 GiB - WAL Size: 48.0 MiB
+
+Which means we need the backup with ID `20210817T031157`, which finished at `03:12:06`, because the one with ID `20210817T031638` finished at `03:16:38`, which is past our recovery target time.
+So the command would be like this:
+
+```bash
+barman recover --remote-ssh-command "ssh postgres@pgrestore" --target-time "2021-08-17 03:14:20" --target-action pause master 20210817T031157 /var/lib/pgsql/13/data/
+
+## Check recovery settings
+
+On pgrestore, note that Barman has filled directory `/var/lib/pgsql/13/data/`:
+
+- cat postgresql.auto.conf
+# Do not edit this file manually!
+# It will be overwritten by the ALTER SYSTEM command.
+archive_mode = 'on'
+#BARMAN#archive_command = 'barman-wal-archive pgbkp1 master %p'
+archive_command = false
+
+# The 'barman-wal-restore' command is provided in the 'barman-cli' package
+restore_command = 'barman-wal-restore -P -U barman 1dc73c3167f9 master %f %p'
+recovery_target_time = '2021-08-17 03:14:20'
+recovery_target_action = 'pause'
+
+If it was PostgreSQL 11 or older, the recovery settings would have been written to the file `recovery.conf` instead.
+We will need to amend the `restore_command`, replacing the container ID with the container name, so it's properly set to:
+```
+restore_command = 'barman-wal-restore -P -U barman pgbkp1 master %f %p'
+
+
+## Start Postgres
+## Check recovery status
+
+SELECT pg_is_in_recovery();
+SELECT pg_is_wal_replay_paused();
+SELECT pg_last_xact_replay_timestamp();
+
+## Advance recovery by another 10 seconds
+
+We know there is a missing row, so let's advance recovery.
+First we need to stop Postgres:
+```bash
+docker exec pgrestore pg_ctlcluster 13 main stop
+```
+Now we amend the file `postgresql.auto.conf`, to change the `recovery_target_time`:
+```
+recovery_target_time = '2021-08-17 03:14:30'
+```
+Then we start Postgres again:
+```bash
+docker exec pgrestore pg_ctlcluster 13 main start
+
+SELECT pg_is_in_recovery();
+SELECT pg_is_wal_replay_paused();
+SELECT pg_last_xact_replay_timestamp();
+SELECT * FROM table_test ORDER BY id;
+
+And we have our complete table data! Which means PITR is complete.
+At this point we could:
+- Take a pg_dump of this table and restore it to the current primary; or
+- Promote this Postgres instance on the pgrestore server to replace the previous primary.
+
+# Create a standby
+--------------------
+Create a standby on pgnode3 using Barman. Use parallel WAL pre-fetch from `barman-wal-restore`.
+## Make sure Postgres is down and PGDATA is empty on the pgnode3 server
+
+pg_ctlcluster 13 main stop
+rm -rf /var/lib/pgsql/13/data/*
+
+## Create a replication slot on the primary
+SELECT pg_create_physical_replication_slot('pgnode3');
+SELECT * FROM pg_replication_slots;
+
+
+## Run the recover
+
+The only difference to a regular recover is the addition of the `--standby-mode` argument. But let's also perform a parallel restore, using 4 workers. Note how the server is now different (pgnode3 instead of pgrestore):
+
+```bash
+barman recover --remote-ssh-command "ssh postgres@barman1" --jobs 2 --standby-mode master latest /var/lib/pgsql/13/data/
+
+Note how now there is a `standby.signal` file instead of a `recovery.signal` file. This means that, instead of promoting the server at the end of recovery, Postgres will stay in recovery as a standby.
+These are the contents of the `postgresql.auto.conf`:
+# Do not edit this file manually!
+# It will be overwritten by the ALTER SYSTEM command.
+archive_mode = 'on'
+#BARMAN#archive_command = 'barman-wal-archive pgbkp1 master %p'
+archive_command = false
+
+# The 'barman-wal-restore' command is provided in the 'barman-cli' package
+restore_command = 'barman-wal-restore  -U barman 1dc73c3167f9 master %f %p'
+
+First we need to fix the `restore_command`, replacing the container ID with the container name. We will also add `-p 4`, to set parallel WAL pre-fetch to gather next 4 WAL files:
+restore_command = 'barman-wal-restore -U barman -p 4 pgbkp1 master %f %p'
+```
+We are also going to add the following settings so the standby is able to attach to the primary as a standby:
+```
+primary_conninfo = 'host=pgnode1'
+primary_slot_name = 'pgnode3'
+
+Setting `primary_conninfo` and `primary_slot_name` are not required if you don't need the standby to be attached to the primary. In this case, the standby will keep retrieving WAL files from Barman only through `restore_command`. In this case we say Barman is set as a WAL hub.
+
+## Start Postgres
+
+```bash
+docker exec pgnode3 pg_ctlcluster 13 main start
+SELECT * FROM pg_stat_replication;
+SELECT * FROM pg_replication_slots;
